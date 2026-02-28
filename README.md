@@ -2,6 +2,8 @@
 
 This document explains how the TS asset changes are integrated into the OpenSim build and deployment flow.
 
+## This is highly experimental.
+
 ## Why there is no separate `TSAssetService` project in `prebuild.xml`
 
 `TSAssetConnector` is implemented inside the existing AssetService assembly:
