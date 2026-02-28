@@ -1,8 +1,10 @@
 # TS Asset Service Integration Notes
 
-This document explains how the TS asset changes are integrated into the OpenSim build and deployment flow.
+**Revision:** 0.3
 
-## This is highly experimental.
+**This is highly experimental.**
+
+This document explains how the TS asset changes are integrated into the OpenSim build and deployment flow.
 
 ## Why there is no separate `TSAssetService` project in `prebuild.xml`
 
@@ -60,7 +62,7 @@ Use the existing `AssetService` section, but point it to `TSAssetConnector` and 
 [AssetService]
 LocalServiceModule = "OpenSim.Services.AssetService.dll:TSAssetConnector"
 StorageProvider = "OpenSim.Data.MySQL.dll"
-ConnectionString = "Source=127.0.0.1;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+ConnectionString = "Data Source=127.0.0.1;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
 DefaultAssetLoader = "OpenSim.Framework.AssetLoader.Filesystem.dll"
 AssetLoaderArgs = "./assets/AssetSets.xml"
 
@@ -70,15 +72,15 @@ AssetLoaderArgs = "./assets/AssetSets.xml"
 [TSAssetService]
 ; Data plugin used by TSAssetConnector
 StorageProvider = "OpenSim.Data.MySQL.dll"
-ConnectionString = "Source=127.0.0.1;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+ConnectionString = "Data Source=127.0.0.1;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
 
 ; Optional: explicit type list (sbyte range supports negatives)
 ; TSAssetType = "-2,-1,0,1,2,3,5,6,7,8,10,13,20,21,22,24,49,56,57"
 
 ; Optional: route specific types to other DB connections
 ; AssetDatabases = "
-;   -2:Source=127.0.0.1;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-;   49:Source=127.0.0.1;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
+;   -2:Data Source=127.0.0.1;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
+;   49:Data Source=127.0.0.1;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
 ; "
 
 ; Optional fallback migration behavior
@@ -95,3 +97,78 @@ Notes:
 - `TSAssetConnector` is loaded from `OpenSim.Services.AssetService.dll`.
 - No separate `TSAssetService` assembly is required in `prebuild.xml`.
 - Keep `EnableFallbackAutoDelete = false` until migration behavior is validated on your server.
+
+## Recommended activation strategy (safe rollout)
+
+Use a staged activation to avoid accidental full migration load.
+
+### 1) Baseline mode (TS disabled)
+
+Keep standard asset service active:
+
+```ini
+[AssetService]
+;LocalServiceModule = "OpenSim.Services.AssetService.dll:TSAssetConnector"
+LocalServiceModule = "OpenSim.Services.AssetService.dll:AssetService"
+StorageProvider = "OpenSim.Data.MySQL.dll:MySQLAssetData"
+```
+
+This should be your default before TS tests.
+
+### 2) Controlled TS activation
+
+Switch only the service module first:
+
+```ini
+[AssetService]
+LocalServiceModule = "OpenSim.Services.AssetService.dll:TSAssetConnector"
+StorageProvider = "OpenSim.Data.MySQL.dll:MySQLAssetData"
+FallbackService = "OpenSim.Services.AssetService.dll:AssetService"
+```
+
+Use conservative TS settings for first rollout:
+
+```ini
+[TSAssetService]
+StorageProvider = "OpenSim.Data.MySQL.dll:MySQLtsAssetData"
+EnableFallbackAutoMigration = false
+EnableFallbackAutoDelete = false
+MigrationCheckIntervalSeconds = 60
+MigrationBatchSize = 25
+MigrationLowTrafficMaxRequests = 3
+MigrationQueueMax = 50000
+```
+
+Why this is optimal for first activation:
+
+- Read misses still resolve through fallback service.
+- New TS writes can work without aggressive background migration.
+- No automatic deletion of fallback data during validation phase.
+
+### 3) Validation phase
+
+Validate in this order:
+
+1. Service starts cleanly and loads `TSAssetConnector`.
+2. New assets are readable after write.
+3. Existing legacy assets are still readable via fallback.
+4. No unexpected performance spikes on DB.
+
+### 4) Optional migration tuning (after successful validation)
+
+Only after stable tests:
+
+- Set `EnableFallbackAutoMigration = true` if you want retry queue migration in low traffic windows.
+- Keep `EnableFallbackAutoDelete = false` initially.
+- Enable `EnableFallbackAutoDelete = true` only after confirming data parity and backup policy.
+
+### 5) Immediate rollback path
+
+If behavior is not acceptable, rollback with one change:
+
+```ini
+[AssetService]
+LocalServiceModule = "OpenSim.Services.AssetService.dll:AssetService"
+```
+
+This disables TS routing immediately without removing TS code.

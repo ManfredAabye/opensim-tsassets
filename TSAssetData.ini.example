@@ -1,0 +1,51 @@
+; TSAssetData.ini.example
+; Production-ready TSAsset configuration blocks
+; Copy these sections into opensim/bin/Robust.HG.ini.example
+
+[AssetService]
+	LocalServiceModule = "OpenSim.Services.AssetService.dll:TSAssetConnector"
+	StorageProvider = "OpenSim.Data.MySQL.dll:MySQLAssetData"
+	ConnectionString = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	FallbackService = "OpenSim.Services.AssetService.dll:AssetService"
+
+	DefaultAssetLoader = "OpenSim.Framework.AssetLoader.Filesystem.dll"
+	AssetLoaderArgs = "./assets/AssetSets.xml"
+	AllowRemoteDelete = false
+	AllowRemoteDeleteAllTypes = false
+
+[TSAssetService]
+	Enabled = true
+
+	StorageProvider = "OpenSim.Data.MySQL.dll:MySQLtsAssetData"
+	ConnectionString = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+
+	TSAssetType = ""
+
+	EnableFallbackAutoMigration = true
+	EnableFallbackAutoDelete = false
+	MigrationCheckIntervalSeconds = 60
+	MigrationLowTrafficMaxRequests = 3
+	MigrationBatchSize = 25
+	MigrationQueueMax = 50000
+
+	; Editierbar: nur Kern-Typen. Alle anderen Typen nutzen automatisch die Default-ConnectionString oben.
+	AssetDatabase_-2 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_0 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_1 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_3 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_5 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_6 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_7 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_10 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_13 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_20 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_21 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_49 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_56 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+	AssetDatabase_57 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+
+; Optional after successful validation and backups:
+; EnableFallbackAutoDelete = true
+
+; Quick rollback in [AssetService]:
+; LocalServiceModule = "OpenSim.Services.AssetService.dll:AssetService"
