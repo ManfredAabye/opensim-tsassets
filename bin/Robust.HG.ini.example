@@ -257,7 +257,7 @@
     ; Uncomment these lines if you want to use PGSQL storage
     ; Change the connection string to your db details
     ;StorageProvider = "OpenSim.Data.PGSQL.dll"
-    ;ConnectionString = "Server=localhost;Database=opensim;User Id=opensim; password=***;"
+    ;ConnectionString = "Data Source=localhost;Database=opensim;User Id=opensim; password=***;"
 
     ; MySQL
     ; Uncomment these lines if you want to use MySQL storage
@@ -265,7 +265,7 @@
     ; If using MySQL 8.0.4 or later, check that default-authentication-plugin=mysql_native_password
     ;  rather than caching_sha2_password is set in /etc/mysql/mysql.conf.d/mysqld.cnf (not applicable to MariaDB).
     StorageProvider = "OpenSim.Data.MySQL.dll"
-    ConnectionString = "Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    ConnectionString = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
 
 
 ; * As an example, the below configuration precisely mimicks the legacy
@@ -276,8 +276,8 @@
 [AssetService]
 
     ;; Choose an asset service (Only one option should be enabled)
-    LocalServiceModule = "OpenSim.Services.AssetService.dll:TSAssetConnector"
-    ;LocalServiceModule = "OpenSim.Services.AssetService.dll:AssetService"
+    ;LocalServiceModule = "OpenSim.Services.AssetService.dll:TSAssetConnector"
+    LocalServiceModule = "OpenSim.Services.AssetService.dll:AssetService"
     ;LocalServiceModule = "OpenSim.Services.FSAssetService.dll:FSAssetConnector"
 
     ;; FSAssets Directories. Base directory, where final asset files are stored and Spool directory for temp files
@@ -289,8 +289,8 @@
 	;; for secondary instances uncoment this line
 	;SecondaryInstance = true
 
-    ;; Optional fallback to original asset service if TS routing misses
-    FallbackService = "OpenSim.Services.AssetService.dll:AssetService"
+    ;; FallbackService is only needed when TSAssetConnector is enabled
+    ;FallbackService = "OpenSim.Services.AssetService.dll:AssetService"
 
     ;; How many days since last updating the access time before its updated again by FSAssets when accessing an asset
     ;; Reduces DB calls if asset is requested often. Default value 0 will always update access time
@@ -301,7 +301,7 @@
 
     ;; Legacy provider used by FallbackService (optional but recommended)
     StorageProvider = "OpenSim.Data.MySQL.dll:MySQLAssetData"
-    ConnectionString = "Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    ConnectionString = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
 
     ;; FSAssets uses a folder structure to reduce file access times. By default that structure is 00/00/00
     ;; Setting this to true will switch to an older 000/000 format, which can cause issues with long file lists
@@ -328,9 +328,12 @@
 
 [TSAssetService]
 
+    ;; Master switch for TS asset service. Must be true to activate TSAssetConnector.
+    Enabled = false
+
     ;; TS provider (explicit class avoids wrong provider selection)
     StorageProvider = "OpenSim.Data.MySQL.dll:MySQLtsAssetData"
-    ConnectionString = "Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    ConnectionString = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
 
     ;; Optional type allowlist. Empty means all asset types.
     TSAssetType = ""
@@ -346,34 +349,22 @@
     MigrationBatchSize = 25
     MigrationQueueMax = 50000
 
-    ;; Per-type DB routing. Format: AssetType:ConnectionString
-    ;; Everything was inserted here without any consideration.
-    AssetDatabases = "
-        -2:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        0:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        1:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        2:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        3:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        5:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        6:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        7:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        8:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        10:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        11:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        13:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        17:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        18:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        19:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        20:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        21:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        22:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        24:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        25:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        26:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        49:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        56:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-        57:Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;;
-    "
+    ;; Per-type DB routing (editierbar): nur Kern-Typen.
+    ;; Alle anderen Typen nutzen automatisch die Default-ConnectionString oben.
+    AssetDatabase_-2 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_0 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_1 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_3 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_5 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_6 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_7 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_10 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_13 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_20 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_21 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_49 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_56 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
+    AssetDatabase_57 = "Data Source=localhost;Database=robust;User ID=opensim;Password=opensim123;Old Guids=true;SslMode=None;"
 
 ; * This configuration loads the inventory server modules. It duplicates
 ; * the function of the legacy inventory server

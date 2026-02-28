@@ -78,6 +78,9 @@ namespace OpenSim.Services.AssetService
             IConfig tsConfig = config.Configs["TSAssetService"];
             IConfig dbConfig = config.Configs["DatabaseService"];
 
+            if (tsConfig == null || !tsConfig.GetBoolean("Enabled", false))
+                throw new Exception("TSAssetConnector disabled. Set [TSAssetService] Enabled = true to enable.");
+
             string storageProvider = string.Empty;
             string defaultConnectionString = string.Empty;
 
@@ -124,7 +127,10 @@ namespace OpenSim.Services.AssetService
             AddProbeDatabase(m_defaultDatabase);
 
             if (tsConfig != null)
+            {
                 ParseTypedDatabaseMappings(tsConfig.GetString("AssetDatabases", string.Empty), storageProvider);
+                ParseTypedDatabaseMappingsFromKeys(tsConfig, storageProvider);
+            }
 
             string loaderName = assetConfig.GetString("DefaultAssetLoader", string.Empty);
             if (!string.IsNullOrEmpty(loaderName))
@@ -175,6 +181,11 @@ namespace OpenSim.Services.AssetService
             }
 
             m_log.InfoFormat("[TSASSET SERVICE]: Enabled with {0} type routes", m_typeDatabases.Count);
+        }
+
+        public TSAssetConnector(IConfigSource config, string configName)
+            : this(config)
+        {
         }
 
         public AssetBase Get(string id)
@@ -489,7 +500,7 @@ namespace OpenSim.Services.AssetService
             if (string.IsNullOrWhiteSpace(rawMappings))
                 return;
 
-            string[] lines = rawMappings.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            string[] lines = rawMappings.Split(new char[] { '\r', '\n', '|' }, StringSplitOptions.RemoveEmptyEntries);
             for (int i = 0; i < lines.Length; i++)
             {
                 string line = lines[i].Trim();
@@ -521,6 +532,60 @@ namespace OpenSim.Services.AssetService
                 if (string.IsNullOrEmpty(connectionString))
                 {
                     m_log.WarnFormat("[TSASSET SERVICE]: Ignoring empty connection string for asset type {0}", assetType);
+                    continue;
+                }
+
+                IAssetDataPlugin db = GetOrCreateDatabase(storageProvider, connectionString);
+                m_typeDatabases[assetType] = db;
+                AddProbeDatabase(db);
+            }
+        }
+
+        private void ParseTypedDatabaseMappingsFromKeys(IConfig tsConfig, string storageProvider)
+        {
+            if (tsConfig == null)
+                return;
+
+            string[] keys = tsConfig.GetKeys();
+            if (keys == null || keys.Length == 0)
+                return;
+
+            for (int i = 0; i < keys.Length; i++)
+            {
+                string key = keys[i];
+                if (string.IsNullOrWhiteSpace(key))
+                    continue;
+
+                string prefix = null;
+                if (key.StartsWith("AssetDatabase_", StringComparison.OrdinalIgnoreCase))
+                    prefix = "AssetDatabase_";
+                else if (key.StartsWith("AssetDatabase.", StringComparison.OrdinalIgnoreCase))
+                    prefix = "AssetDatabase.";
+
+                if (prefix == null)
+                    continue;
+
+                string typeToken = key.Substring(prefix.Length).Trim();
+                if (!sbyte.TryParse(typeToken, NumberStyles.Integer, CultureInfo.InvariantCulture, out sbyte assetType))
+                {
+                    m_log.WarnFormat("[TSASSET SERVICE]: Ignoring invalid asset type key '{0}'", key);
+                    continue;
+                }
+
+                if (m_allowedTypes.Count > 0 && !m_allowedTypes.Contains(assetType))
+                    continue;
+
+                string connectionString = tsConfig.GetString(key, string.Empty).Trim();
+                if (connectionString.Length >= 2 &&
+                    connectionString[0] == '"' &&
+                    connectionString[connectionString.Length - 1] == '"')
+                {
+                    connectionString = connectionString.Substring(1, connectionString.Length - 2).Trim();
+                }
+
+                if (string.IsNullOrEmpty(connectionString))
+                {
+                    m_log.WarnFormat("[TSASSET SERVICE]: Ignoring empty connection string for asset type key '{0}'", key);
                     continue;
                 }
 
