@@ -44,6 +44,8 @@ namespace OpenSim.Services.AssetService
     public class TSAssetConnector : ServiceBase, IAssetService
     {
         private static readonly ILog m_log = LogManager.GetLogger(MethodBase.GetCurrentMethod().DeclaringType);
+        private static readonly object m_commandLock = new object();
+        private static bool m_commandsRegistered;
 
         private readonly Dictionary<sbyte, IAssetDataPlugin> m_typeDatabases = new Dictionary<sbyte, IAssetDataPlugin>();
         private readonly Dictionary<string, IAssetDataPlugin> m_connectionDatabases = new Dictionary<string, IAssetDataPlugin>(StringComparer.OrdinalIgnoreCase);
@@ -110,6 +112,8 @@ namespace OpenSim.Services.AssetService
 
             if (string.IsNullOrEmpty(defaultConnectionString))
                 throw new Exception("Missing database connection string");
+
+            RegisterConsoleCommands();
 
             ParseAllowedTypes(tsConfig);
 
@@ -700,6 +704,479 @@ namespace OpenSim.Services.AssetService
             {
                 m_log.WarnFormat("[TSASSET SERVICE]: Fallback auto-delete exception for asset {0}: {1}", id, e.Message);
             }
+        }
+
+        private void RegisterConsoleCommands()
+        {
+            if (MainConsole.Instance == null)
+                return;
+
+            lock (m_commandLock)
+            {
+                if (m_commandsRegistered)
+                    return;
+
+                MainConsole.Instance.Commands.AddCommand(
+                    "tsasset",
+                    false,
+                    "tsmove",
+                    "tsmove <from> <to> --force [--reset] [--batch=<n>] [--timeout=<sec>]",
+                    "Move tsasset rows between tables (requires --force). Supports resume/reset and batch/timeout overrides",
+                    HandleTsMove);
+
+                MainConsole.Instance.Commands.AddCommand(
+                    "tsasset",
+                    false,
+                    "tsshowmove",
+                    "tsshowmove <from> <to>",
+                    "Preview tsasset move counts without writing changes",
+                    HandleTsShowMove);
+
+                MainConsole.Instance.Commands.AddCommand(
+                    "tsasset",
+                    false,
+                    "tsfind",
+                    "tsfind <asset-id>",
+                    "Find tsasset table and index status for one asset id",
+                    HandleTsFind);
+
+                MainConsole.Instance.Commands.AddCommand(
+                    "tsasset",
+                    false,
+                    "tsverify",
+                    "tsverify [all|assets|<type>|assets_<type>]",
+                    "Verify tsasset table/index consistency",
+                    HandleTsVerify);
+
+                MainConsole.Instance.Commands.AddCommand(
+                    "tsasset",
+                    false,
+                    "tsreindex",
+                    "tsreindex [all|assets|<type>|assets_<type>] --force [--batch=<n>] [--timeout=<sec>]",
+                    "Rebuild tsasset index entries for typed tables or clean legacy index entries",
+                    HandleTsReindex);
+
+                MainConsole.Instance.Commands.AddCommand(
+                    "tsasset",
+                    false,
+                    "tscleanlegacy",
+                    "tscleanlegacy --force [--batch=<n>] [--timeout=<sec>]",
+                    "Remove tsassets_index rows that still point to legacy assets table",
+                    HandleTsCleanLegacy);
+
+                m_commandsRegistered = true;
+            }
+        }
+
+        private void HandleTsMove(string module, string[] args)
+        {
+            HandleTsMoveInternal(args, false);
+        }
+
+        private void HandleTsShowMove(string module, string[] args)
+        {
+            HandleTsMoveInternal(args, true);
+        }
+
+        private void HandleTsFind(string module, string[] args)
+        {
+            if (args == null || args.Length < 2)
+            {
+                MainConsole.Instance.Output("Syntax: tsfind <asset-id>");
+                return;
+            }
+
+            string assetId = args[1];
+            List<IAssetDataPlugin> uniqueDatabases = BuildUniqueDatabases();
+
+            int supportedDatabases = 0;
+            bool foundAny = false;
+
+            for (int i = 0; i < uniqueDatabases.Count; i++)
+            {
+                if (!(uniqueDatabases[i] is ITSAssetAdminData adminData))
+                    continue;
+
+                supportedDatabases++;
+
+                if (!adminData.TryFindAssetLocation(assetId, out TSAssetFindReport report, out string errorMessage))
+                {
+                    MainConsole.Instance.Output(string.Format("tsfind failed on database #{0}: {1}", i + 1, errorMessage));
+                    return;
+                }
+
+                if (!report.Found)
+                    continue;
+
+                foundAny = true;
+                MainConsole.Instance.Output(
+                    string.Format(
+                        CultureInfo.InvariantCulture,
+                        "tsfind {0}: table={1}, index={2}, index-type={3}",
+                        report.AssetId,
+                        string.IsNullOrEmpty(report.TableName) ? "<unknown>" : report.TableName,
+                        report.HasIndexEntry ? "yes" : "no",
+                        report.HasIndexEntry ? report.IndexAssetType.ToString(CultureInfo.InvariantCulture) : "n/a"));
+            }
+
+            if (supportedDatabases == 0)
+            {
+                MainConsole.Instance.Output("tsfind is not supported by the configured asset data plugin(s)");
+                return;
+            }
+
+            if (!foundAny)
+                MainConsole.Instance.Output(string.Format(CultureInfo.InvariantCulture, "tsfind {0}: not found", assetId));
+        }
+
+        private void HandleTsVerify(string module, string[] args)
+        {
+            string scope = (args != null && args.Length >= 2) ? args[1] : "all";
+
+            List<IAssetDataPlugin> uniqueDatabases = BuildUniqueDatabases();
+
+            int supportedDatabases = 0;
+            int totalTablesChecked = 0;
+            int totalRows = 0;
+            int totalMissingIndexRows = 0;
+            int totalWrongIndexTypeRows = 0;
+            int totalOrphanIndexRows = 0;
+            int totalLegacyRowsWithIndex = 0;
+
+            for (int i = 0; i < uniqueDatabases.Count; i++)
+            {
+                if (!(uniqueDatabases[i] is ITSAssetAdminData adminData))
+                    continue;
+
+                supportedDatabases++;
+
+                if (!adminData.TryVerifyAssets(scope, out TSAssetVerifyReport report, out string errorMessage))
+                {
+                    MainConsole.Instance.Output(string.Format("tsverify failed on database #{0}: {1}", i + 1, errorMessage));
+                    return;
+                }
+
+                totalTablesChecked += report.TablesChecked;
+                totalRows += report.TotalRows;
+                totalMissingIndexRows += report.MissingIndexRows;
+                totalWrongIndexTypeRows += report.WrongIndexTypeRows;
+                totalOrphanIndexRows += report.OrphanIndexRows;
+                totalLegacyRowsWithIndex += report.LegacyRowsWithIndex;
+            }
+
+            if (supportedDatabases == 0)
+            {
+                MainConsole.Instance.Output("tsverify is not supported by the configured asset data plugin(s)");
+                return;
+            }
+
+            MainConsole.Instance.Output(
+                string.Format(
+                    CultureInfo.InvariantCulture,
+                    "tsverify {0}: tables={1}, rows={2}, missing-index={3}, wrong-index-type={4}, orphan-index={5}, legacy-with-index={6}",
+                    scope,
+                    totalTablesChecked,
+                    totalRows,
+                    totalMissingIndexRows,
+                    totalWrongIndexTypeRows,
+                    totalOrphanIndexRows,
+                    totalLegacyRowsWithIndex));
+        }
+
+        private void HandleTsReindex(string module, string[] args)
+        {
+            bool hasExplicitScope = args != null && args.Length >= 2 && !args[1].StartsWith("-", StringComparison.Ordinal);
+            string scope = hasExplicitScope ? args[1] : "all";
+            int optionsStartIndex = hasExplicitScope ? 2 : 1;
+
+            if (!TryParseAdminWriteOptions(args, optionsStartIndex, out TSAssetMoveOptions options, out string optionError))
+            {
+                MainConsole.Instance.Output(optionError);
+                return;
+            }
+
+            List<IAssetDataPlugin> uniqueDatabases = BuildUniqueDatabases();
+            int supportedDatabases = 0;
+
+            TSAssetReindexReport total = new TSAssetReindexReport
+            {
+                Scope = scope,
+                TablesProcessed = 0,
+                RowsScanned = 0,
+                IndexRowsUpserted = 0,
+                IndexRowsDeleted = 0
+            };
+
+            for (int i = 0; i < uniqueDatabases.Count; i++)
+            {
+                if (!(uniqueDatabases[i] is ITSAssetAdminData adminData))
+                    continue;
+
+                supportedDatabases++;
+
+                if (!adminData.TryReindexAssets(scope, options, out TSAssetReindexReport report, out string errorMessage))
+                {
+                    MainConsole.Instance.Output(string.Format("tsreindex failed on database #{0}: {1}", i + 1, errorMessage));
+                    return;
+                }
+
+                total.TablesProcessed += report.TablesProcessed;
+                total.RowsScanned += report.RowsScanned;
+                total.IndexRowsUpserted += report.IndexRowsUpserted;
+                total.IndexRowsDeleted += report.IndexRowsDeleted;
+            }
+
+            if (supportedDatabases == 0)
+            {
+                MainConsole.Instance.Output("tsreindex is not supported by the configured asset data plugin(s)");
+                return;
+            }
+
+            MainConsole.Instance.Output(
+                string.Format(
+                    CultureInfo.InvariantCulture,
+                    "tsreindex {0}: tables={1}, scanned={2}, index-upserted={3}, index-deleted={4}",
+                    scope,
+                    total.TablesProcessed,
+                    total.RowsScanned,
+                    total.IndexRowsUpserted,
+                    total.IndexRowsDeleted));
+        }
+
+        private void HandleTsCleanLegacy(string module, string[] args)
+        {
+            if (!TryParseAdminWriteOptions(args, 1, out TSAssetMoveOptions options, out string optionError))
+            {
+                MainConsole.Instance.Output(optionError);
+                return;
+            }
+
+            List<IAssetDataPlugin> uniqueDatabases = BuildUniqueDatabases();
+            int supportedDatabases = 0;
+
+            TSAssetReindexReport total = new TSAssetReindexReport
+            {
+                Scope = "assets",
+                TablesProcessed = 0,
+                RowsScanned = 0,
+                IndexRowsUpserted = 0,
+                IndexRowsDeleted = 0
+            };
+
+            for (int i = 0; i < uniqueDatabases.Count; i++)
+            {
+                if (!(uniqueDatabases[i] is ITSAssetAdminData adminData))
+                    continue;
+
+                supportedDatabases++;
+
+                if (!adminData.TryCleanLegacyIndex(options, out TSAssetReindexReport report, out string errorMessage))
+                {
+                    MainConsole.Instance.Output(string.Format("tscleanlegacy failed on database #{0}: {1}", i + 1, errorMessage));
+                    return;
+                }
+
+                total.TablesProcessed += report.TablesProcessed;
+                total.RowsScanned += report.RowsScanned;
+                total.IndexRowsUpserted += report.IndexRowsUpserted;
+                total.IndexRowsDeleted += report.IndexRowsDeleted;
+            }
+
+            if (supportedDatabases == 0)
+            {
+                MainConsole.Instance.Output("tscleanlegacy is not supported by the configured asset data plugin(s)");
+                return;
+            }
+
+            MainConsole.Instance.Output(
+                string.Format(
+                    CultureInfo.InvariantCulture,
+                    "tscleanlegacy: tables={0}, scanned={1}, index-deleted={2}",
+                    total.TablesProcessed,
+                    total.RowsScanned,
+                    total.IndexRowsDeleted));
+        }
+
+        private bool TryParseAdminWriteOptions(string[] args, int startIndex, out TSAssetMoveOptions options, out string error)
+        {
+            options = new TSAssetMoveOptions
+            {
+                ResetCheckpoint = false,
+                BatchSize = 0,
+                CommandTimeoutSeconds = 0
+            };
+
+            error = string.Empty;
+            bool hasForce = false;
+
+            if (args == null)
+            {
+                error = "Missing command arguments";
+                return false;
+            }
+
+            for (int argIndex = startIndex; argIndex < args.Length; argIndex++)
+            {
+                string flag = args[argIndex];
+
+                if (flag.Equals("--force", StringComparison.OrdinalIgnoreCase) ||
+                    flag.Equals("-f", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasForce = true;
+                    continue;
+                }
+
+                if (flag.Equals("--reset", StringComparison.OrdinalIgnoreCase))
+                {
+                    options.ResetCheckpoint = true;
+                    continue;
+                }
+
+                if (flag.StartsWith("--batch=", StringComparison.OrdinalIgnoreCase))
+                {
+                    string value = flag.Substring("--batch=".Length).Trim();
+                    if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int batchSize) || batchSize <= 0)
+                    {
+                        error = "Invalid --batch value. Example: --batch=2000";
+                        return false;
+                    }
+
+                    options.BatchSize = batchSize;
+                    continue;
+                }
+
+                if (flag.StartsWith("--timeout=", StringComparison.OrdinalIgnoreCase))
+                {
+                    string value = flag.Substring("--timeout=".Length).Trim();
+                    if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int timeoutSeconds) || timeoutSeconds <= 0)
+                    {
+                        error = "Invalid --timeout value. Example: --timeout=600";
+                        return false;
+                    }
+
+                    options.CommandTimeoutSeconds = timeoutSeconds;
+                    continue;
+                }
+            }
+
+            if (!hasForce)
+            {
+                error = "Write command aborted: missing --force flag";
+                return false;
+            }
+
+            return true;
+        }
+
+        private List<IAssetDataPlugin> BuildUniqueDatabases()
+        {
+            List<IAssetDataPlugin> uniqueDatabases = new List<IAssetDataPlugin>();
+            for (int i = 0; i < m_probeOrder.Count; i++)
+            {
+                IAssetDataPlugin db = m_probeOrder[i];
+                bool alreadyAdded = false;
+
+                for (int j = 0; j < uniqueDatabases.Count; j++)
+                {
+                    if (object.ReferenceEquals(uniqueDatabases[j], db))
+                    {
+                        alreadyAdded = true;
+                        break;
+                    }
+                }
+
+                if (!alreadyAdded)
+                    uniqueDatabases.Add(db);
+            }
+
+            return uniqueDatabases;
+        }
+
+        private void HandleTsMoveInternal(string[] args, bool previewOnly)
+        {
+            if (args == null || args.Length < 3)
+            {
+                MainConsole.Instance.Output(previewOnly ? "Syntax: tsshowmove <from> <to>" : "Syntax: tsmove <from> <to> --force");
+                MainConsole.Instance.Output("Examples: tsmove assets 7 | tsmove 7 assets | tsmove assets_7 assets");
+                return;
+            }
+
+            string from = args[1];
+            string to = args[2];
+            TSAssetMoveOptions moveOptions = new TSAssetMoveOptions
+            {
+                ResetCheckpoint = false,
+                BatchSize = 0,
+                CommandTimeoutSeconds = 0
+            };
+
+            if (!previewOnly)
+            {
+                if (!TryParseAdminWriteOptions(args, 3, out moveOptions, out string optionError))
+                {
+                    MainConsole.Instance.Output(optionError.Replace("Write command", "tsmove"));
+                    MainConsole.Instance.Output(string.Format(CultureInfo.InvariantCulture, "Preview first: tsshowmove {0} {1}", from, to));
+                    MainConsole.Instance.Output(string.Format(CultureInfo.InvariantCulture, "Execute move: tsmove {0} {1} --force", from, to));
+                    return;
+                }
+            }
+
+            List<IAssetDataPlugin> uniqueDatabases = BuildUniqueDatabases();
+
+            int supportedDatabases = 0;
+            int totalCandidates = 0;
+            int totalAlreadyInTarget = 0;
+            int totalInserted = 0;
+            int totalDeletedFromSource = 0;
+            int totalIndexAffected = 0;
+
+            for (int i = 0; i < uniqueDatabases.Count; i++)
+            {
+                if (!(uniqueDatabases[i] is ITSAssetAdminData adminData))
+                    continue;
+
+                supportedDatabases++;
+
+                bool ok;
+                TSAssetMoveReport report;
+                string errorMessage;
+
+                if (previewOnly)
+                    ok = adminData.TryPreviewMoveAssets(from, to, out report, out errorMessage);
+                else
+                    ok = adminData.TryMoveAssets(from, to, moveOptions, out report, out errorMessage);
+
+                if (!ok)
+                {
+                    MainConsole.Instance.Output(string.Format("{0} failed on database #{1}: {2}", previewOnly ? "tsshowmove" : "tsmove", i + 1, errorMessage));
+                    return;
+                }
+
+                totalCandidates += report.CandidateCount;
+                totalAlreadyInTarget += report.AlreadyInTargetCount;
+                totalInserted += report.InsertedCount;
+                totalDeletedFromSource += report.DeletedFromSourceCount;
+                totalIndexAffected += report.IndexAffectedCount;
+            }
+
+            if (supportedDatabases == 0)
+            {
+                MainConsole.Instance.Output(string.Format("{0} is not supported by the configured asset data plugin(s)", previewOnly ? "tsshowmove" : "tsmove"));
+                return;
+            }
+
+            MainConsole.Instance.Output(
+                string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0} {1} -> {2}: candidates={3}, inserted={4}, already-in-target={5}, deleted-from-source={6}, index-affected={7}",
+                    previewOnly ? "tsshowmove" : "tsmove",
+                    from,
+                    to,
+                    totalCandidates,
+                    totalInserted,
+                    totalAlreadyInTarget,
+                    totalDeletedFromSource,
+                    totalIndexAffected));
         }
     }
 }

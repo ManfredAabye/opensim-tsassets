@@ -30,6 +30,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using log4net;
 using MySql.Data.MySqlClient;
 using OpenMetaverse;
@@ -42,20 +43,25 @@ namespace OpenSim.Data.MySQL
 	/// MySQL storage provider that stores assets in type-specific tables:
 	/// assets_{assetType}. A legacy fallback to table "assets" can be enabled explicitly.
 	/// </summary>
-	public class MySQLtsAssetData : AssetDataBase
+	public class MySQLtsAssetData : AssetDataBase, ITSAssetAdminData
 	{
 		private static readonly ILog m_log = LogManager.GetLogger(MethodBase.GetCurrentMethod().DeclaringType);
 
 		private const string LegacyTableName = "assets";
 		private const string IndexTableName = "tsassets_index";
+		private const string MoveCheckpointTableName = "tsassets_move_checkpoint";
 		private const string TypedTableNameFormat = "assets_{0}";
 		private const bool DefaultFallbackToLegacy = false;
+		private const int DefaultTsAdminBatchSize = 1000;
+		private const int DefaultTsAdminCommandTimeoutSeconds = 300;
 
 		private readonly object m_tableSync = new object();
 		private readonly HashSet<string> m_initializedTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
 		private string m_connectionString;
 		private bool m_fallbackToLegacy;
+		private int m_tsAdminBatchSize = DefaultTsAdminBatchSize;
+		private int m_tsAdminCommandTimeoutSeconds = DefaultTsAdminCommandTimeoutSeconds;
 
 		protected virtual Assembly Assembly
 		{
@@ -81,6 +87,8 @@ namespace OpenSim.Data.MySQL
 
 			m_connectionString = connect;
 			m_fallbackToLegacy = TryReadBooleanSetting(connect, "TSFallbackToLegacyAssets", DefaultFallbackToLegacy);
+			m_tsAdminBatchSize = Math.Max(1, TryReadIntSetting(connect, "TSAdminBatchSize", DefaultTsAdminBatchSize));
+			m_tsAdminCommandTimeoutSeconds = Math.Max(30, TryReadIntSetting(connect, "TSAdminCommandTimeoutSeconds", DefaultTsAdminCommandTimeoutSeconds));
 
 			using (MySqlConnection dbcon = new MySqlConnection(m_connectionString))
 			{
@@ -90,6 +98,7 @@ namespace OpenSim.Data.MySQL
 				migration.Update();
 
 				EnsureIndexTable(dbcon);
+				EnsureMoveCheckpointTable(dbcon);
 			}
 		}
 
@@ -328,7 +337,1015 @@ namespace OpenSim.Data.MySQL
 			}
 		}
 
+		public bool TryMoveAssets(string from, string to, out TSAssetMoveReport report, out string errorMessage)
+		{
+			TSAssetMoveOptions options = new TSAssetMoveOptions
+			{
+				ResetCheckpoint = false,
+				BatchSize = 0,
+				CommandTimeoutSeconds = 0
+			};
+
+			return TryMoveAssets(from, to, options, out report, out errorMessage);
+		}
+
+		public bool TryMoveAssets(string from, string to, TSAssetMoveOptions options, out TSAssetMoveReport report, out string errorMessage)
+		{
+			report = new TSAssetMoveReport
+			{
+				Source = from ?? string.Empty,
+				Destination = to ?? string.Empty,
+				CandidateCount = 0,
+				AlreadyInTargetCount = 0,
+				InsertedCount = 0,
+				DeletedFromSourceCount = 0,
+				IndexAffectedCount = 0
+			};
+
+			errorMessage = string.Empty;
+
+			if (!TryParseMoveTable(from, out MoveTableSpec sourceSpec, out string parseSourceError))
+			{
+				errorMessage = parseSourceError;
+				return false;
+			}
+
+			if (!TryParseMoveTable(to, out MoveTableSpec targetSpec, out string parseTargetError))
+			{
+				errorMessage = parseTargetError;
+				return false;
+			}
+
+			if (sourceSpec.TableName.Equals(targetSpec.TableName, StringComparison.OrdinalIgnoreCase))
+			{
+				errorMessage = string.Format(CultureInfo.InvariantCulture, "Source and target resolve to the same table '{0}'", sourceSpec.TableName);
+				return false;
+			}
+
+			try
+			{
+				using (MySqlConnection dbcon = new MySqlConnection(m_connectionString))
+				{
+					dbcon.Open();
+
+					EnsureIndexTable(dbcon);
+
+					if (!sourceSpec.IsLegacy && !TableExists(dbcon, sourceSpec.TableName))
+						return true;
+
+					if (targetSpec.IsLegacy)
+					{
+						if (!TableExists(dbcon, targetSpec.TableName))
+						{
+							errorMessage = string.Format(CultureInfo.InvariantCulture, "Target table '{0}' does not exist", targetSpec.TableName);
+							return false;
+						}
+					}
+					else
+					{
+						EnsureTypeTable(targetSpec.TableName);
+					}
+
+					string whereClause = BuildMoveWhereClause(sourceSpec, targetSpec);
+					int sourceAssetTypeFilter = targetSpec.IsLegacy ? 0 : targetSpec.AssetType;
+					int effectiveBatchSize = options.BatchSize > 0 ? options.BatchSize : m_tsAdminBatchSize;
+					int effectiveCommandTimeoutSeconds = options.CommandTimeoutSeconds > 0 ? options.CommandTimeoutSeconds : m_tsAdminCommandTimeoutSeconds;
+					string operationKey = BuildMoveOperationKey(sourceSpec, targetSpec);
+					string cursorAfter = string.Empty;
+
+					if (options.ResetCheckpoint)
+						DeleteMoveCheckpoint(dbcon, operationKey, effectiveCommandTimeoutSeconds);
+
+					cursorAfter = GetMoveCheckpoint(dbcon, operationKey, effectiveCommandTimeoutSeconds);
+
+					while (true)
+					{
+						using (MySqlTransaction tx = dbcon.BeginTransaction())
+						{
+							try
+							{
+								List<string> batchIds = GetMoveBatchIds(
+									dbcon,
+									tx,
+									sourceSpec,
+									targetSpec,
+									sourceAssetTypeFilter,
+									whereClause,
+									cursorAfter,
+									effectiveBatchSize,
+									effectiveCommandTimeoutSeconds);
+								if (batchIds.Count == 0)
+								{
+									tx.Commit();
+									break;
+								}
+
+								report.CandidateCount += batchIds.Count;
+
+								int alreadyInTarget = CountRowsByIds(dbcon, tx, targetSpec.TableName, batchIds, effectiveCommandTimeoutSeconds);
+								report.AlreadyInTargetCount += alreadyInTarget;
+
+								InsertBatchIntoTarget(dbcon, tx, sourceSpec, targetSpec, batchIds, effectiveCommandTimeoutSeconds);
+
+								int nowInTarget = CountRowsByIds(dbcon, tx, targetSpec.TableName, batchIds, effectiveCommandTimeoutSeconds);
+								report.InsertedCount += Math.Max(0, nowInTarget - alreadyInTarget);
+
+								if (targetSpec.IsLegacy)
+									report.IndexAffectedCount += DeleteRowsByIds(dbcon, tx, IndexTableName, batchIds, effectiveCommandTimeoutSeconds);
+								else
+									report.IndexAffectedCount += UpsertIndexRowsByIds(dbcon, tx, targetSpec.AssetType, batchIds, effectiveCommandTimeoutSeconds);
+
+								report.DeletedFromSourceCount += DeleteRowsByIds(dbcon, tx, sourceSpec.TableName, batchIds, effectiveCommandTimeoutSeconds);
+
+								cursorAfter = batchIds[batchIds.Count - 1];
+								UpsertMoveCheckpoint(dbcon, tx, operationKey, cursorAfter, effectiveCommandTimeoutSeconds);
+
+								tx.Commit();
+							}
+							catch
+							{
+								TryRollback(tx);
+								throw;
+							}
+						}
+					}
+
+					DeleteMoveCheckpoint(dbcon, operationKey, effectiveCommandTimeoutSeconds);
+
+					return true;
+				}
+			}
+			catch (Exception e)
+			{
+				errorMessage = BuildExceptionMessage(e);
+				m_log.ErrorFormat("[TSASSET DB]: MySQL failure moving assets from {0} to {1}. Error: {2}", from, to, e.Message);
+				return false;
+			}
+		}
+
+		public bool TryPreviewMoveAssets(string from, string to, out TSAssetMoveReport report, out string errorMessage)
+		{
+			report = new TSAssetMoveReport
+			{
+				Source = from ?? string.Empty,
+				Destination = to ?? string.Empty,
+				CandidateCount = 0,
+				AlreadyInTargetCount = 0,
+				InsertedCount = 0,
+				DeletedFromSourceCount = 0,
+				IndexAffectedCount = 0
+			};
+
+			errorMessage = string.Empty;
+
+			if (!TryParseMoveTable(from, out MoveTableSpec sourceSpec, out string parseSourceError))
+			{
+				errorMessage = parseSourceError;
+				return false;
+			}
+
+			if (!TryParseMoveTable(to, out MoveTableSpec targetSpec, out string parseTargetError))
+			{
+				errorMessage = parseTargetError;
+				return false;
+			}
+
+			if (sourceSpec.TableName.Equals(targetSpec.TableName, StringComparison.OrdinalIgnoreCase))
+			{
+				errorMessage = string.Format(CultureInfo.InvariantCulture, "Source and target resolve to the same table '{0}'", sourceSpec.TableName);
+				return false;
+			}
+
+			try
+			{
+				using (MySqlConnection dbcon = new MySqlConnection(m_connectionString))
+				{
+					dbcon.Open();
+
+					if (!sourceSpec.IsLegacy && !TableExists(dbcon, sourceSpec.TableName))
+						return true;
+
+					if (!targetSpec.IsLegacy && !TableExists(dbcon, targetSpec.TableName))
+						EnsureTypeTable(targetSpec.TableName);
+
+					if (targetSpec.IsLegacy && !TableExists(dbcon, targetSpec.TableName))
+					{
+						errorMessage = string.Format(CultureInfo.InvariantCulture, "Target table '{0}' does not exist", targetSpec.TableName);
+						return false;
+					}
+
+					string whereClause = BuildMoveWhereClause(sourceSpec, targetSpec);
+					int sourceAssetTypeFilter = targetSpec.IsLegacy ? 0 : targetSpec.AssetType;
+
+					using (MySqlTransaction tx = dbcon.BeginTransaction(IsolationLevel.ReadCommitted))
+					{
+						try
+						{
+							report.CandidateCount = ExecuteCount(
+								dbcon,
+								tx,
+								$"SELECT COUNT(*) FROM `{sourceSpec.TableName}` s {whereClause}",
+								sourceAssetTypeFilter,
+								sourceSpec,
+								targetSpec);
+
+							report.AlreadyInTargetCount = ExecuteCount(
+								dbcon,
+								tx,
+								$"SELECT COUNT(*) FROM `{sourceSpec.TableName}` s INNER JOIN `{targetSpec.TableName}` t ON t.id = s.id {whereClause}",
+								sourceAssetTypeFilter,
+								sourceSpec,
+								targetSpec);
+
+							report.InsertedCount = Math.Max(0, report.CandidateCount - report.AlreadyInTargetCount);
+							report.DeletedFromSourceCount = report.CandidateCount;
+
+							if (targetSpec.IsLegacy)
+								report.IndexAffectedCount = report.CandidateCount;
+							else
+								report.IndexAffectedCount = report.CandidateCount;
+
+							tx.Commit();
+							return true;
+						}
+						catch
+						{
+							TryRollback(tx);
+							throw;
+						}
+					}
+				}
+			}
+			catch (Exception e)
+			{
+				errorMessage = BuildExceptionMessage(e);
+				m_log.ErrorFormat("[TSASSET DB]: MySQL failure previewing move from {0} to {1}. Error: {2}", from, to, e.Message);
+				return false;
+			}
+		}
+
+		public bool TryFindAssetLocation(string assetId, out TSAssetFindReport report, out string errorMessage)
+		{
+			report = new TSAssetFindReport
+			{
+				AssetId = assetId ?? string.Empty,
+				Found = false,
+				TableName = string.Empty,
+				HasIndexEntry = false,
+				IndexAssetType = 0
+			};
+
+			errorMessage = string.Empty;
+
+			if (!UUID.TryParse(assetId, out UUID parsedId))
+			{
+				errorMessage = "Invalid asset UUID";
+				return false;
+			}
+
+			try
+			{
+				using (MySqlConnection dbcon = new MySqlConnection(m_connectionString))
+				{
+					dbcon.Open();
+
+					if (TryGetIndexedAssetType(dbcon, parsedId, out sbyte indexType))
+					{
+						report.HasIndexEntry = true;
+						report.IndexAssetType = indexType;
+
+						string typedTable = GetTypeTableName(indexType);
+						if (TableExists(dbcon, typedTable))
+						{
+							if (ExecuteCountById(dbcon, typedTable, parsedId) > 0)
+							{
+								report.Found = true;
+								report.TableName = typedTable;
+								return true;
+							}
+						}
+					}
+
+					if (TableExists(dbcon, LegacyTableName) && ExecuteCountById(dbcon, LegacyTableName, parsedId) > 0)
+					{
+						report.Found = true;
+						report.TableName = LegacyTableName;
+						return true;
+					}
+
+					List<sbyte> types = GetExistingTypedTableTypes(dbcon);
+					for (int i = 0; i < types.Count; i++)
+					{
+						string tableName = GetTypeTableName(types[i]);
+						if (report.HasIndexEntry && tableName.Equals(GetTypeTableName((sbyte)report.IndexAssetType), StringComparison.OrdinalIgnoreCase))
+							continue;
+
+						if (ExecuteCountById(dbcon, tableName, parsedId) > 0)
+						{
+							report.Found = true;
+							report.TableName = tableName;
+							return true;
+						}
+					}
+
+					return true;
+				}
+			}
+			catch (Exception e)
+			{
+				errorMessage = e.Message;
+				m_log.ErrorFormat("[TSASSET DB]: MySQL failure finding asset {0}. Error: {1}", assetId, e.Message);
+				return false;
+			}
+		}
+
+		public bool TryVerifyAssets(string scope, out TSAssetVerifyReport report, out string errorMessage)
+		{
+			report = new TSAssetVerifyReport
+			{
+				Scope = string.IsNullOrWhiteSpace(scope) ? "all" : scope.Trim(),
+				TablesChecked = 0,
+				TotalRows = 0,
+				MissingIndexRows = 0,
+				WrongIndexTypeRows = 0,
+				OrphanIndexRows = 0,
+				LegacyRowsWithIndex = 0
+			};
+
+			errorMessage = string.Empty;
+
+			try
+			{
+				using (MySqlConnection dbcon = new MySqlConnection(m_connectionString))
+				{
+					dbcon.Open();
+					EnsureIndexTable(dbcon);
+
+					string normalizedScope = string.IsNullOrWhiteSpace(scope) ? "all" : scope.Trim();
+					List<MoveTableSpec> verifyTables = new List<MoveTableSpec>();
+
+					if (normalizedScope.Equals("all", StringComparison.OrdinalIgnoreCase))
+					{
+						if (TableExists(dbcon, LegacyTableName))
+						{
+							verifyTables.Add(new MoveTableSpec
+							{
+								TableName = LegacyTableName,
+								IsLegacy = true,
+								AssetType = 0
+							});
+						}
+
+						List<sbyte> types = GetExistingTypedTableTypes(dbcon);
+						for (int i = 0; i < types.Count; i++)
+						{
+							verifyTables.Add(new MoveTableSpec
+							{
+								TableName = GetTypeTableName(types[i]),
+								IsLegacy = false,
+								AssetType = types[i]
+							});
+						}
+					}
+					else
+					{
+						if (!TryParseMoveTable(normalizedScope, out MoveTableSpec requestedTable, out string parseError))
+						{
+							errorMessage = parseError;
+							return false;
+						}
+
+						if (!TableExists(dbcon, requestedTable.TableName))
+						{
+							return true;
+						}
+
+						verifyTables.Add(requestedTable);
+					}
+
+					for (int i = 0; i < verifyTables.Count; i++)
+					{
+						MoveTableSpec table = verifyTables[i];
+						report.TablesChecked++;
+						report.TotalRows += ExecuteCountRaw(dbcon, string.Format(CultureInfo.InvariantCulture, "SELECT COUNT(*) FROM `{0}`", table.TableName));
+
+						if (table.IsLegacy)
+						{
+							report.LegacyRowsWithIndex += ExecuteCountRaw(
+								dbcon,
+								$"SELECT COUNT(*) FROM `{LegacyTableName}` l INNER JOIN `{IndexTableName}` i ON i.id = l.id");
+							continue;
+						}
+
+						report.MissingIndexRows += ExecuteCountRaw(
+							dbcon,
+							$"SELECT COUNT(*) FROM `{table.TableName}` t LEFT JOIN `{IndexTableName}` i ON i.id = t.id WHERE i.id IS NULL");
+
+						report.WrongIndexTypeRows += ExecuteCountRaw(
+							dbcon,
+							$"SELECT COUNT(*) FROM `{table.TableName}` t INNER JOIN `{IndexTableName}` i ON i.id = t.id WHERE i.assetType <> {table.AssetType.ToString(CultureInfo.InvariantCulture)}");
+
+						report.OrphanIndexRows += ExecuteCountRaw(
+							dbcon,
+							$"SELECT COUNT(*) FROM `{IndexTableName}` i LEFT JOIN `{table.TableName}` t ON t.id = i.id WHERE i.assetType = {table.AssetType.ToString(CultureInfo.InvariantCulture)} AND t.id IS NULL");
+					}
+
+					return true;
+				}
+			}
+			catch (Exception e)
+			{
+				errorMessage = e.Message;
+				m_log.ErrorFormat("[TSASSET DB]: MySQL failure verifying scope {0}. Error: {1}", scope, e.Message);
+				return false;
+			}
+		}
+
+		public bool TryReindexAssets(string scope, TSAssetMoveOptions options, out TSAssetReindexReport report, out string errorMessage)
+		{
+			report = new TSAssetReindexReport
+			{
+				Scope = string.IsNullOrWhiteSpace(scope) ? "all" : scope.Trim(),
+				TablesProcessed = 0,
+				RowsScanned = 0,
+				IndexRowsUpserted = 0,
+				IndexRowsDeleted = 0
+			};
+
+			errorMessage = string.Empty;
+
+			try
+			{
+				using (MySqlConnection dbcon = new MySqlConnection(m_connectionString))
+				{
+					dbcon.Open();
+					EnsureIndexTable(dbcon);
+					EnsureMoveCheckpointTable(dbcon);
+
+					int effectiveBatchSize = options.BatchSize > 0 ? options.BatchSize : m_tsAdminBatchSize;
+					int effectiveCommandTimeoutSeconds = options.CommandTimeoutSeconds > 0 ? options.CommandTimeoutSeconds : m_tsAdminCommandTimeoutSeconds;
+
+					if (!TryResolveScopeTables(dbcon, scope, out List<MoveTableSpec> tables, out errorMessage))
+						return false;
+
+					for (int tableIndex = 0; tableIndex < tables.Count; tableIndex++)
+					{
+						MoveTableSpec table = tables[tableIndex];
+						report.TablesProcessed++;
+
+						string opKey = string.Format(CultureInfo.InvariantCulture, "reindex:{0}", table.TableName);
+						if (options.ResetCheckpoint)
+							DeleteMoveCheckpoint(dbcon, opKey, effectiveCommandTimeoutSeconds);
+
+						string cursorAfter = GetMoveCheckpoint(dbcon, opKey, effectiveCommandTimeoutSeconds);
+
+						while (true)
+						{
+							using (MySqlTransaction tx = dbcon.BeginTransaction())
+							{
+								try
+								{
+									List<string> ids = GetBatchIdsByTable(dbcon, tx, table.TableName, cursorAfter, effectiveBatchSize, effectiveCommandTimeoutSeconds);
+									if (ids.Count == 0)
+									{
+										tx.Commit();
+										break;
+									}
+
+									report.RowsScanned += ids.Count;
+
+									if (table.IsLegacy)
+										report.IndexRowsDeleted += DeleteRowsByIds(dbcon, tx, IndexTableName, ids, effectiveCommandTimeoutSeconds);
+									else
+										report.IndexRowsUpserted += UpsertIndexRowsByIds(dbcon, tx, table.AssetType, ids, effectiveCommandTimeoutSeconds);
+
+									cursorAfter = ids[ids.Count - 1];
+									UpsertMoveCheckpoint(dbcon, tx, opKey, cursorAfter, effectiveCommandTimeoutSeconds);
+
+									tx.Commit();
+								}
+								catch
+								{
+									TryRollback(tx);
+									throw;
+								}
+							}
+						}
+
+						DeleteMoveCheckpoint(dbcon, opKey, effectiveCommandTimeoutSeconds);
+					}
+
+					return true;
+				}
+			}
+			catch (Exception e)
+			{
+				errorMessage = BuildExceptionMessage(e);
+				m_log.ErrorFormat("[TSASSET DB]: MySQL failure reindexing scope {0}. Error: {1}", scope, e.Message);
+				return false;
+			}
+		}
+
+		public bool TryCleanLegacyIndex(TSAssetMoveOptions options, out TSAssetReindexReport report, out string errorMessage)
+		{
+			return TryReindexAssets("assets", options, out report, out errorMessage);
+		}
+
 		#endregion
+
+		private sealed class MoveTableSpec
+		{
+			public string TableName;
+			public bool IsLegacy;
+			public sbyte AssetType;
+		}
+
+		private static bool TryParseMoveTable(string token, out MoveTableSpec spec, out string error)
+		{
+			spec = null;
+			error = string.Empty;
+
+			if (string.IsNullOrWhiteSpace(token))
+			{
+				error = "Table token is empty";
+				return false;
+			}
+
+			string normalized = token.Trim();
+
+			if (normalized.Equals(LegacyTableName, StringComparison.OrdinalIgnoreCase))
+			{
+				spec = new MoveTableSpec
+				{
+					TableName = LegacyTableName,
+					IsLegacy = true,
+					AssetType = 0
+				};
+				return true;
+			}
+
+			if (sbyte.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out sbyte directType))
+			{
+				spec = new MoveTableSpec
+				{
+					TableName = GetTypeTableName(directType),
+					IsLegacy = false,
+					AssetType = directType
+				};
+				return true;
+			}
+
+			Match typedName = Regex.Match(normalized, "^assets_(-?\\d+)$", RegexOptions.IgnoreCase);
+			if (typedName.Success)
+			{
+				if (sbyte.TryParse(typedName.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out sbyte parsedType))
+				{
+					spec = new MoveTableSpec
+					{
+						TableName = GetTypeTableName(parsedType),
+						IsLegacy = false,
+						AssetType = parsedType
+					};
+					return true;
+				}
+			}
+
+			error = string.Format(CultureInfo.InvariantCulture, "Invalid table/type token '{0}'. Use 'assets', '<type>' or 'assets_<type>'", token);
+			return false;
+		}
+
+		private bool TryResolveScopeTables(MySqlConnection dbcon, string scope, out List<MoveTableSpec> tables, out string error)
+		{
+			tables = new List<MoveTableSpec>();
+			error = string.Empty;
+
+			string normalizedScope = string.IsNullOrWhiteSpace(scope) ? "all" : scope.Trim();
+
+			if (normalizedScope.Equals("all", StringComparison.OrdinalIgnoreCase))
+			{
+				if (TableExists(dbcon, LegacyTableName))
+				{
+					tables.Add(new MoveTableSpec
+					{
+						TableName = LegacyTableName,
+						IsLegacy = true,
+						AssetType = 0
+					});
+				}
+
+				List<sbyte> types = GetExistingTypedTableTypes(dbcon);
+				for (int i = 0; i < types.Count; i++)
+				{
+					tables.Add(new MoveTableSpec
+					{
+						TableName = GetTypeTableName(types[i]),
+						IsLegacy = false,
+						AssetType = types[i]
+					});
+				}
+
+				return true;
+			}
+
+			if (!TryParseMoveTable(normalizedScope, out MoveTableSpec requestedTable, out string parseError))
+			{
+				error = parseError;
+				return false;
+			}
+
+			if (!TableExists(dbcon, requestedTable.TableName))
+				return true;
+
+			tables.Add(requestedTable);
+			return true;
+		}
+
+		private static string BuildMoveWhereClause(MoveTableSpec source, MoveTableSpec target)
+		{
+			if (source.IsLegacy && !target.IsLegacy)
+				return "WHERE s.assetType = ?sourceTypeFilter";
+
+			return string.Empty;
+		}
+
+		private static void BindMoveParameters(MySqlCommand cmd, int sourceAssetTypeFilter, MoveTableSpec source, MoveTableSpec target)
+		{
+			if (source.IsLegacy && !target.IsLegacy)
+				cmd.Parameters.AddWithValue("?sourceTypeFilter", sourceAssetTypeFilter);
+		}
+
+		private static bool TableExists(MySqlConnection dbcon, string tableName)
+		{
+			using (MySqlCommand cmd = new MySqlCommand(
+				"SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?tableName LIMIT 1",
+				dbcon))
+			{
+				cmd.Parameters.AddWithValue("?tableName", tableName);
+				object value = cmd.ExecuteScalar();
+				return value != null && value != DBNull.Value;
+			}
+		}
+
+		private static int ExecuteCountById(MySqlConnection dbcon, string tableName, UUID id)
+		{
+			using (MySqlCommand cmd = new MySqlCommand($"SELECT COUNT(*) FROM `{tableName}` WHERE id=?id", dbcon))
+			{
+				cmd.Parameters.AddWithValue("?id", id.ToString());
+				object scalar = cmd.ExecuteScalar();
+				if (scalar == null || scalar is DBNull)
+					return 0;
+
+				return Convert.ToInt32(scalar, CultureInfo.InvariantCulture);
+			}
+		}
+
+		private static int ExecuteCountRaw(MySqlConnection dbcon, string sql)
+		{
+			using (MySqlCommand cmd = new MySqlCommand(sql, dbcon))
+			{
+				object scalar = cmd.ExecuteScalar();
+				if (scalar == null || scalar is DBNull)
+					return 0;
+
+				return Convert.ToInt32(scalar, CultureInfo.InvariantCulture);
+			}
+		}
+
+		private static List<sbyte> GetExistingTypedTableTypes(MySqlConnection dbcon)
+		{
+			List<sbyte> result = new List<sbyte>();
+
+			using (MySqlCommand cmd = new MySqlCommand(
+				"SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name REGEXP '^assets_-?[0-9]+$'",
+				dbcon))
+			using (MySqlDataReader reader = cmd.ExecuteReader())
+			{
+				while (reader.Read())
+				{
+					string tableName = reader["table_name"].ToString();
+					Match typedMatch = Regex.Match(tableName, "^assets_(-?\\d+)$", RegexOptions.IgnoreCase);
+					if (!typedMatch.Success)
+						continue;
+
+					if (sbyte.TryParse(typedMatch.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out sbyte type))
+						result.Add(type);
+				}
+			}
+
+			result.Sort();
+			return result;
+		}
+
+		private static int ExecuteCount(MySqlConnection dbcon, MySqlTransaction tx, string sql, int sourceAssetTypeFilter, MoveTableSpec source, MoveTableSpec target)
+		{
+			using (MySqlCommand cmd = new MySqlCommand(sql, dbcon, tx))
+			{
+				cmd.CommandTimeout = DefaultTsAdminCommandTimeoutSeconds;
+				BindMoveParameters(cmd, sourceAssetTypeFilter, source, target);
+				object scalar = cmd.ExecuteScalar();
+				if (scalar == null || scalar is DBNull)
+					return 0;
+
+				return Convert.ToInt32(scalar, CultureInfo.InvariantCulture);
+			}
+		}
+
+		private static List<string> GetMoveBatchIds(
+			MySqlConnection dbcon,
+			MySqlTransaction tx,
+			MoveTableSpec sourceSpec,
+			MoveTableSpec targetSpec,
+			int sourceAssetTypeFilter,
+			string whereClause,
+			string cursorAfter,
+			int batchSize,
+			int commandTimeoutSeconds)
+		{
+			List<string> ids = new List<string>(batchSize);
+			string scopedWhere = BuildScopedWhereClause(whereClause, !string.IsNullOrEmpty(cursorAfter));
+
+			using (MySqlCommand cmd = new MySqlCommand(
+				$"SELECT s.id FROM `{sourceSpec.TableName}` s {scopedWhere} ORDER BY s.id LIMIT ?limit",
+				dbcon,
+				tx))
+			{
+				cmd.CommandTimeout = commandTimeoutSeconds;
+				BindMoveParameters(cmd, sourceAssetTypeFilter, sourceSpec, targetSpec);
+
+				if (!string.IsNullOrEmpty(cursorAfter))
+					cmd.Parameters.AddWithValue("?cursorAfter", cursorAfter);
+
+				cmd.Parameters.AddWithValue("?limit", batchSize);
+
+				using (MySqlDataReader reader = cmd.ExecuteReader())
+				{
+					while (reader.Read())
+						ids.Add(reader["id"].ToString());
+				}
+			}
+
+			return ids;
+		}
+
+		private static List<string> GetBatchIdsByTable(
+			MySqlConnection dbcon,
+			MySqlTransaction tx,
+			string tableName,
+			string cursorAfter,
+			int batchSize,
+			int commandTimeoutSeconds)
+		{
+			List<string> ids = new List<string>(batchSize);
+			string whereClause = string.IsNullOrEmpty(cursorAfter) ? string.Empty : "WHERE id > ?cursorAfter";
+
+			using (MySqlCommand cmd = new MySqlCommand(
+				$"SELECT id FROM `{tableName}` {whereClause} ORDER BY id LIMIT ?limit",
+				dbcon,
+				tx))
+			{
+				cmd.CommandTimeout = commandTimeoutSeconds;
+				if (!string.IsNullOrEmpty(cursorAfter))
+					cmd.Parameters.AddWithValue("?cursorAfter", cursorAfter);
+
+				cmd.Parameters.AddWithValue("?limit", batchSize);
+
+				using (MySqlDataReader reader = cmd.ExecuteReader())
+				{
+					while (reader.Read())
+						ids.Add(reader["id"].ToString());
+				}
+			}
+
+			return ids;
+		}
+
+		private static int CountRowsByIds(MySqlConnection dbcon, MySqlTransaction tx, string tableName, List<string> ids, int commandTimeoutSeconds)
+		{
+			if (ids == null || ids.Count == 0)
+				return 0;
+
+			using (MySqlCommand cmd = new MySqlCommand(
+				$"SELECT COUNT(*) FROM `{tableName}` WHERE id IN ({BuildIdInClause(ids.Count)})",
+				dbcon,
+				tx))
+			{
+				cmd.CommandTimeout = commandTimeoutSeconds;
+				AddIdParameters(cmd, ids);
+				object scalar = cmd.ExecuteScalar();
+				if (scalar == null || scalar is DBNull)
+					return 0;
+
+				return Convert.ToInt32(scalar, CultureInfo.InvariantCulture);
+			}
+		}
+
+		private static void InsertBatchIntoTarget(MySqlConnection dbcon, MySqlTransaction tx, MoveTableSpec sourceSpec, MoveTableSpec targetSpec, List<string> ids, int commandTimeoutSeconds)
+		{
+			if (ids == null || ids.Count == 0)
+				return;
+
+			using (MySqlCommand cmd = new MySqlCommand(
+				$"INSERT IGNORE INTO `{targetSpec.TableName}` " +
+				"(id, name, description, assetType, local, temporary, create_time, access_time, asset_flags, CreatorID, data) " +
+				"SELECT s.id, s.name, s.description, " +
+				(targetSpec.IsLegacy ? "s.assetType" : "?targetAssetType") +
+				", s.local, s.temporary, s.create_time, s.access_time, s.asset_flags, s.CreatorID, s.data " +
+				$"FROM `{sourceSpec.TableName}` s WHERE s.id IN ({BuildIdInClause(ids.Count)})",
+				dbcon,
+				tx))
+			{
+				cmd.CommandTimeout = commandTimeoutSeconds;
+				AddIdParameters(cmd, ids);
+
+				if (!targetSpec.IsLegacy)
+					cmd.Parameters.AddWithValue("?targetAssetType", targetSpec.AssetType);
+
+				cmd.ExecuteNonQuery();
+			}
+		}
+
+		private static int DeleteRowsByIds(MySqlConnection dbcon, MySqlTransaction tx, string tableName, List<string> ids, int commandTimeoutSeconds)
+		{
+			if (ids == null || ids.Count == 0)
+				return 0;
+
+			using (MySqlCommand cmd = new MySqlCommand(
+				$"DELETE FROM `{tableName}` WHERE id IN ({BuildIdInClause(ids.Count)})",
+				dbcon,
+				tx))
+			{
+				cmd.CommandTimeout = commandTimeoutSeconds;
+				AddIdParameters(cmd, ids);
+				return cmd.ExecuteNonQuery();
+			}
+		}
+
+		private static int UpsertIndexRowsByIds(MySqlConnection dbcon, MySqlTransaction tx, sbyte targetType, List<string> ids, int commandTimeoutSeconds)
+		{
+			if (ids == null || ids.Count == 0)
+				return 0;
+
+			using (MySqlCommand cmd = new MySqlCommand(
+				$"INSERT INTO `{IndexTableName}` (id, assetType, updated_at) " +
+				$"SELECT id, ?assetType, ?updatedAt FROM `{GetTypeTableName(targetType)}` WHERE id IN ({BuildIdInClause(ids.Count)}) " +
+				"ON DUPLICATE KEY UPDATE assetType = VALUES(assetType), updated_at = VALUES(updated_at)",
+				dbcon,
+				tx))
+			{
+				cmd.CommandTimeout = commandTimeoutSeconds;
+				cmd.Parameters.AddWithValue("?assetType", targetType);
+				cmd.Parameters.AddWithValue("?updatedAt", (int)Utils.DateTimeToUnixTime(DateTime.UtcNow));
+				AddIdParameters(cmd, ids);
+				return cmd.ExecuteNonQuery();
+			}
+		}
+
+		private static string BuildScopedWhereClause(string whereClause, bool includeCursor)
+		{
+			if (!includeCursor)
+				return whereClause;
+
+			if (string.IsNullOrWhiteSpace(whereClause))
+				return "WHERE s.id > ?cursorAfter";
+
+			return string.Concat(whereClause, " AND s.id > ?cursorAfter");
+		}
+
+		private static string BuildMoveOperationKey(MoveTableSpec sourceSpec, MoveTableSpec targetSpec)
+		{
+			return string.Format(CultureInfo.InvariantCulture, "{0}->{1}", sourceSpec.TableName, targetSpec.TableName);
+		}
+
+		private static void EnsureMoveCheckpointTable(MySqlConnection dbcon)
+		{
+			string sql =
+				$"CREATE TABLE IF NOT EXISTS `{MoveCheckpointTableName}` (" +
+				"`op_key` varchar(190) NOT NULL," +
+				"`last_id` char(36) NOT NULL DEFAULT ''," +
+				"`updated_at` int(11) NOT NULL DEFAULT '0'," +
+				"PRIMARY KEY (`op_key`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8";
+
+			using (MySqlCommand cmd = new MySqlCommand(sql, dbcon))
+				cmd.ExecuteNonQuery();
+		}
+
+		private static string GetMoveCheckpoint(MySqlConnection dbcon, string operationKey, int commandTimeoutSeconds)
+		{
+			using (MySqlCommand cmd = new MySqlCommand(
+				$"SELECT last_id FROM `{MoveCheckpointTableName}` WHERE op_key=?opKey",
+				dbcon))
+			{
+				cmd.CommandTimeout = commandTimeoutSeconds;
+				cmd.Parameters.AddWithValue("?opKey", operationKey);
+				object scalar = cmd.ExecuteScalar();
+				if (scalar == null || scalar is DBNull)
+					return string.Empty;
+
+				return scalar.ToString();
+			}
+		}
+
+		private static void UpsertMoveCheckpoint(MySqlConnection dbcon, MySqlTransaction tx, string operationKey, string lastId, int commandTimeoutSeconds)
+		{
+			using (MySqlCommand cmd = new MySqlCommand(
+				$"INSERT INTO `{MoveCheckpointTableName}` (op_key, last_id, updated_at) VALUES (?opKey, ?lastId, ?updatedAt) " +
+				"ON DUPLICATE KEY UPDATE last_id = VALUES(last_id), updated_at = VALUES(updated_at)",
+				dbcon,
+				tx))
+			{
+				cmd.CommandTimeout = commandTimeoutSeconds;
+				cmd.Parameters.AddWithValue("?opKey", operationKey);
+				cmd.Parameters.AddWithValue("?lastId", lastId ?? string.Empty);
+				cmd.Parameters.AddWithValue("?updatedAt", (int)Utils.DateTimeToUnixTime(DateTime.UtcNow));
+				cmd.ExecuteNonQuery();
+			}
+		}
+
+		private static void DeleteMoveCheckpoint(MySqlConnection dbcon, string operationKey, int commandTimeoutSeconds)
+		{
+			using (MySqlCommand cmd = new MySqlCommand(
+				$"DELETE FROM `{MoveCheckpointTableName}` WHERE op_key=?opKey",
+				dbcon))
+			{
+				cmd.CommandTimeout = commandTimeoutSeconds;
+				cmd.Parameters.AddWithValue("?opKey", operationKey);
+				cmd.ExecuteNonQuery();
+			}
+		}
+
+		private static string BuildIdInClause(int count)
+		{
+			string[] placeholders = new string[count];
+			for (int i = 0; i < count; i++)
+				placeholders[i] = "?id" + i.ToString(CultureInfo.InvariantCulture);
+
+			return string.Join(",", placeholders);
+		}
+
+		private static void AddIdParameters(MySqlCommand cmd, List<string> ids)
+		{
+			for (int i = 0; i < ids.Count; i++)
+				cmd.Parameters.AddWithValue("?id" + i.ToString(CultureInfo.InvariantCulture), ids[i]);
+		}
+
+		private static void TryRollback(MySqlTransaction tx)
+		{
+			if (tx == null)
+				return;
+
+			try
+			{
+				tx.Rollback();
+			}
+			catch
+			{
+			}
+		}
+
+		private static string BuildExceptionMessage(Exception e)
+		{
+			if (e == null)
+				return string.Empty;
+
+			string message = e.Message;
+			Exception inner = e.InnerException;
+
+			while (inner != null)
+			{
+				if (!string.IsNullOrEmpty(inner.Message))
+					message = string.Concat(message, " | ", inner.Message);
+
+				inner = inner.InnerException;
+			}
+
+			return message;
+		}
+
+		private static int TryReadIntSetting(string connectionString, string key, int defaultValue)
+		{
+			if (string.IsNullOrEmpty(connectionString) || string.IsNullOrEmpty(key))
+				return defaultValue;
+
+			string[] parts = connectionString.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+			foreach (string rawPart in parts)
+			{
+				string part = rawPart.Trim();
+				int eqIndex = part.IndexOf('=');
+				if (eqIndex <= 0 || eqIndex == part.Length - 1)
+					continue;
+
+				string k = part.Substring(0, eqIndex).Trim();
+				if (!k.Equals(key, StringComparison.OrdinalIgnoreCase))
+					continue;
+
+				string v = part.Substring(eqIndex + 1).Trim();
+				if (int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed))
+					return parsed;
+			}
+
+			return defaultValue;
+		}
 
 		private static bool TryReadBooleanSetting(string connectionString, string key, bool defaultValue)
 		{
