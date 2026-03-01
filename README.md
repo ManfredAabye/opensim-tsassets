@@ -1,6 +1,6 @@
 # TS Asset Service Integration Notes
 
-**Revision:** 0.3
+**Revision:** 0.4.3
 
 **This is highly experimental.**
 
@@ -172,3 +172,4 @@ LocalServiceModule = "OpenSim.Services.AssetService.dll:AssetService"
 ```
 
 This disables TS routing immediately without removing TS code.
+
